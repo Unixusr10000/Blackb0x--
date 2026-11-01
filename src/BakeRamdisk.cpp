@@ -469,9 +469,11 @@ static bool spliceFileContentInPlace(const std::string& targetPath, const std::s
     chown(targetPath.c_str(), st.st_uid, st.st_gid);
     // Darwin's struct stat spells these fields st_atimespec/st_mtimespec,
     // where Linux/glibc says st_atim/st_mtim. Same fields, different names.
-    // Worth knowing if you ever try to syntax-check this file off a Mac:
-    // -Dst_atimespec=st_atim -Dst_mtimespec=st_mtim makes it parse.
+#if defined(__APPLE__)
     struct timespec times[2] = {st.st_atimespec, st.st_mtimespec};
+#else
+    struct timespec times[2] = {st.st_atim, st.st_mtim};
+#endif
     utimensat(AT_FDCWD, targetPath.c_str(), times, 0);
     return true;
 }

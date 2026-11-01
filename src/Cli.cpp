@@ -180,16 +180,26 @@ void printCliUsage(const char* argv0) {
     printf("                            hardware.\n");
     printf("  --help                    Show this message\n");
     printf("\n");
-    // Was a Linux-era note telling the user to run under sudo or install a
-    // udev rule for raw USB access. Both are wrong here: this is macOS-only
-    // now, blackb0x reaches the device through IOKit with no special
-    // privilege, and there is no udev. See AGENTS.md ("Root: blackb0x needs
-    // none; bake-firmware requires it unconditionally") -- the privilege
-    // requirement lives entirely in the authoring half, which mounts things.
+    // The privilege story is per-platform. On macOS, blackb0x reaches the
+    // device through IOKit with no special privilege and there is no udev.
+    // On Linux, raw DFU/Recovery USB access is a device-node permission:
+    // either run under sudo, or install the udev rule in README.md's
+    // "One-time system setup (Linux)" section. See AGENTS.md ("Root:
+    // blackb0x needs none; bake-firmware requires it unconditionally") --
+    // on macOS the privilege requirement lives entirely in the authoring
+    // half, which mounts things.
+#if defined(__APPLE__)
     printf("blackb0x needs no special privileges: it reaches a DFU/Recovery-mode device\n");
     printf("through IOKit. Do NOT run it under sudo. Only the authoring tools need root,\n");
     printf("and only bake-firmware's ramdisk half, which mounts disk images -- bake-iboot\n");
     printf("and bake-kernel run rootless in seconds.\n");
+#else
+    printf("blackb0x reaches a DFU/Recovery-mode device through libusb. That needs\n");
+    printf("write access to the device node: either run it under sudo, or install the\n");
+    printf("udev rule from README.md (One-time system setup, Linux) and re-plug the\n");
+    printf("Apple TV. Normal-mode discovery additionally needs the system usbmuxd\n");
+    printf("running with --no-preflight (see README.md).\n");
+#endif
 }
 
 CliOptions parseCliOptions(int argc, char** argv) {
@@ -945,6 +955,7 @@ static bool ensureBakedFirmware(const std::string& deviceModel, const std::strin
     }
 
     if (geteuid() != 0) {
+#if defined(__APPLE__)
         fprintf(stderr,
                 "\nCannot obtain a firmware suite for %s %s. Two ways forward:\n"
                 "\n"
@@ -956,8 +967,36 @@ static bool ensureBakedFirmware(const std::string& deviceModel, const std::strin
                 "    cmake --build build --target authoring -j$(sysctl -n hw.ncpu)\n"
                 "    sudo ./build/bake-firmware --device '%s' --build %s\n",
                 deviceModel.c_str(), buildID.c_str(), deviceModel.c_str(), buildID.c_str());
+#else
+        fprintf(stderr,
+                "\nCannot obtain a firmware suite for %s %s.\n"
+                "\n"
+                "  Rebuild it from CI's patches (no root, no toolchain):\n"
+                "    install GitHub's CLI and sign in --  sudo apt install gh && gh auth login\n"
+                "    then re-run this command.\n"
+                "\n"
+                "  Baking one yourself is not available on Linux: bake-firmware's\n"
+                "  ramdisk half uses macOS's hdiutil. Bake on a Mac, or copy a\n"
+                "  ready-made dist/ suite into this checkout.\n",
+                deviceModel.c_str(), buildID.c_str());
+#endif
         return false;
     }
+
+#if !defined(__APPLE__)
+    // On Linux there is no local-bake fallback at any privilege level:
+    // bake-firmware's ramdisk half shells out to macOS's hdiutil. Say so
+    // directly rather than spawn a bake that cannot succeed.
+    fprintf(stderr,
+            "\nCannot obtain a firmware suite for %s %s: no gh available, and\n"
+            "baking locally is not supported on Linux (bake-firmware's ramdisk\n"
+            "half needs macOS's hdiutil). Install GitHub's CLI and sign in --\n"
+            "  sudo apt install gh && gh auth login\n"
+            "then re-run this command, or copy a ready-made dist/ suite into\n"
+            "this checkout.\n",
+            deviceModel.c_str(), buildID.c_str());
+    return false;
+#endif
 
     printf("Running as root and no gh available -- baking locally instead. This takes a few minutes.\n");
     fflush(stdout);

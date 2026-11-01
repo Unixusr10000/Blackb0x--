@@ -2,25 +2,31 @@ cmake_minimum_required(VERSION 3.16)
 project(blackb0x CXX C)
 
 # ---------------------------------------------------------------------------
-# Apple-only. This is a hard requirement, not a preference.
+# Supported hosts: macOS and Linux.
 #
-# Linux support was removed outright. checkm8 never worked there: the exploit
-# runs to completion and the task-struct overwrite simply never lands, and four
-# separate proposed causes were each refuted by measurement (host-stack
-# limitation, overwrite acceptance, SETUP delivery, consumed-byte count) --
-# docs/HISTORY.md carries the full trail. Every observable matched a working
-# macOS run and the outcome still differed, so there was nothing left to fix
-# from the host side.
+# Linux support was removed outright for a while, and has been restored by
+# the linux-port branch. The historical caveat stands and is stated plainly
+# rather than buried: checkm8 has never been confirmed working from a Linux
+# host -- the exploit sequence runs to completion and the task-struct
+# overwrite simply never lands, and four separate proposed causes were each
+# refuted by measurement (host-stack limitation, overwrite acceptance,
+# SETUP delivery, consumed-byte count) -- docs/HISTORY.md carries the full
+# trail. Everything else (normal-mode discovery, the firmware
+# download/decrypt/patch/re-encrypt pipeline, --dry-run, and the
+# already-pwned paths: AppleTV3,1 via an external Arduino pwn, AppleTV2,1
+# SHAtter) is platform-neutral code that builds and runs on Linux exactly
+# as on macOS. The platform split in this file is therefore kept narrow:
+# Apple frameworks and libirecovery's IOKit backend on Darwin, the vendored
+# libusb and libirecovery's libusb backend everywhere else.
 #
-# Fail here rather than deeper in: without this, a Linux configure gets a long
-# way before dying inside a vendored ExternalProject, where the error has
-# nothing to do with the actual reason.
+# Fail here rather than deeper in on a genuinely unsupported host: without
+# this, a configure gets a long way before dying inside a vendored
+# ExternalProject, where the error has nothing to do with the actual reason.
 # ---------------------------------------------------------------------------
-if(NOT APPLE)
+if(NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR
-        "blackb0x is macOS-only. Linux support was removed -- checkm8 does not "
-        "work there (see docs/HISTORY.md). Build on macOS; Apple Silicon is the "
-        "tested host.")
+        "blackb0x builds on macOS and Linux only. This host is "
+        "${CMAKE_SYSTEM_NAME}; see README.md for the supported hosts.")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -70,6 +76,16 @@ set(DEPS_LIB ${DEPS_PREFIX}/lib)
 set(DEPS_PKGCONFIG ${DEPS_LIB}/pkgconfig)
 file(MAKE_DIRECTORY ${DEPS_INCLUDE})
 file(MAKE_DIRECTORY ${DEPS_PKGCONFIG})
+# libusb installs its header under include/libusb-1.0/ while consumers
+# (libirecovery's configure, via pkg-config) expect it findable; the
+# deps::usb imported target below names this directory in its
+# INTERFACE_INCLUDE_DIRECTORIES, and CMake validates that directory at
+# configure time, before libusb_ext has installed anything -- so it must
+# exist up front even though libusb.h itself only lands at build time.
+# Linux-only: on Darwin nothing links libusb at all.
+if(NOT APPLE)
+    file(MAKE_DIRECTORY ${DEPS_INCLUDE}/libusb-1.0)
+endif()
 
 # Synthetic openssl.pc: libimobiledevice_ext's own configure.ac probes for
 # a pkg-config module literally named "openssl" (PKG_CHECK_MODULES(openssl,
@@ -187,24 +203,49 @@ add_executable(iBoot32Patcher
     third_party/iBoot32Patcher/patchers.c)
 target_include_directories(iBoot32Patcher PRIVATE third_party/iBoot32Patcher)
 
+# The diagnostic-relaxation set shared by every vintage-C target in this
+# file (CBPatcher/iBoot32Patcher here, the blanket xpwn loop below).
+# -Wreturn-mismatch is the Clang / GCC >= 14 spelling; GCC <= 13 (e.g.
+# Mint 21/22's gcc 11-13) hard-errors on the unknown -Wno-error= form
+# ("no option '-Wreturn-mismatch'") instead of merely warning, so it gets
+# its contemporary equivalent -Wreturn-type there. Everything else in the
+# set is spelled identically in both compilers.
+set(BLACKB0X_LEGACY_C_RELAX
+    -Wno-error=implicit-int
+    -Wno-error=implicit-function-declaration
+    -Wno-error=incompatible-pointer-types
+    -Wno-error=int-conversion
+    -fcommon)
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 14)
+    list(APPEND BLACKB0X_LEGACY_C_RELAX -Wno-error=return-type)
+else()
+    list(APPEND BLACKB0X_LEGACY_C_RELAX -Wno-error=return-mismatch)
+endif()
+
 # Same vintage of C as xpwn (2013-2018), same GCC >= 14 tightened-diagnostics
 # issue (see the blanket xpwn relaxation below) — this 32-bit-pointer-vs-
 # 64-bit-host-pointer reverse-engineering code assigns pointers to uint32_t
 # in a few places; not touching that logic, just relaxing the diagnostic.
-target_compile_options(CBPatcher PRIVATE
-    -Wno-error=implicit-int
-    -Wno-error=implicit-function-declaration
-    -Wno-error=incompatible-pointer-types
-    -Wno-error=int-conversion
-    -Wno-error=return-mismatch
-    -fcommon)
-target_compile_options(iBoot32Patcher PRIVATE
-    -Wno-error=implicit-int
-    -Wno-error=implicit-function-declaration
-    -Wno-error=incompatible-pointer-types
-    -Wno-error=int-conversion
-    -Wno-error=return-mismatch
-    -fcommon)
+target_compile_options(CBPatcher PRIVATE ${BLACKB0X_LEGACY_C_RELAX})
+target_compile_options(iBoot32Patcher PRIVATE ${BLACKB0X_LEGACY_C_RELAX})
+
+# CBPatch.c includes Apple's <mach-o/nlist.h>, <mach-o/dyld.h>,
+# <mach-o/fat.h> and <mach/vm_types.h>, which do not exist on Linux. The
+# submodule stays pristine (house rule: no local submodule patches), so
+# on Linux those angle-bracket includes resolve to the first-party shims
+# under src/compat/ instead -- the recovered portable_macho.h definitions,
+# split back into the header names CBPatch.c asks for. Only nlist.h and
+# vm_types.h carry definitions; dyld.h/fat.h are empty (nothing in
+# CBPatcher uses a symbol from either, verified by grep).
+# -include stdint.h: mac_policy.h uses uint32_t without including it,
+# relying on the Apple headers to supply it transitively -- and it is
+# included BEFORE the mach-o headers, so the shims cannot supply it
+# either. (The pre-submodule in-tree copy fixed this by editing
+# mac_policy.h itself; force-include is the no-submodule-edit spelling.)
+if(NOT APPLE)
+    target_include_directories(CBPatcher PRIVATE src/compat)
+    target_compile_options(CBPatcher PRIVATE -include stdint.h)
+endif()
 
 # The former blackb0x_xpwntool static library (a vendored copy of xpwn's own
 # `xpwntool` CLI wrapped as a decrypt() function) is gone. Its decrypt() moved
@@ -396,13 +437,7 @@ foreach(_d ${_xpwn_subdirs})
         if(_t_type STREQUAL "STATIC_LIBRARY" OR _t_type STREQUAL "SHARED_LIBRARY" OR
            _t_type STREQUAL "MODULE_LIBRARY" OR _t_type STREQUAL "OBJECT_LIBRARY" OR
            _t_type STREQUAL "EXECUTABLE")
-            target_compile_options(${_t} PRIVATE
-                -Wno-error=implicit-int
-                -Wno-error=implicit-function-declaration
-                -Wno-error=incompatible-pointer-types
-                -Wno-error=int-conversion
-                -Wno-error=return-mismatch
-                -fcommon)
+            target_compile_options(${_t} PRIVATE ${BLACKB0X_LEGACY_C_RELAX})
         endif()
         if(_t_type STREQUAL "EXECUTABLE")
             # `xpwn` (the static library) links ${BZIP2_LIBRARIES}/${PNG_LIBRARIES}
@@ -466,6 +501,42 @@ endforeach()
 
 set(AUTOTOOLS_ENV ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${DEPS_PKGCONFIG}")
 
+# libusb, vendored and built from source like every other dependency here --
+# Linux-only. On Darwin, libirecovery uses its native IOKit backend and
+# nothing in this project links libusb at all; on Linux, libusb IS the USB
+# backend for libirecovery (and therefore for blackb0x and blackb0x-pwn).
+# This restores the exact block the Linux-support removal deleted, at the
+# same upstream pin (see .gitmodules / the deps::usb block below).
+#
+# --disable-udev: udev (systemd's device/hotplug library) has NO
+# static-archive build on essentially any mainstream Linux distribution --
+# systemd deliberately never ships one -- so a genuinely fully-static
+# libusb cannot link it in at all. Confirmed there's a real, supported,
+# non-udev fallback rather than just accepting degraded functionality:
+# libusb's own configure.ac falls back to a Linux netlink-socket-based
+# enumeration/hotplug backend (linux_netlink.c) when udev is disabled --
+# netlink is a raw kernel IPC mechanism with no userspace library
+# dependency at all, not a degraded/deprecated code path. This preserves
+# the same hotplug-arrival detection DeviceManager.cpp relies on for
+# noticing when an Apple TV enters DFU mode, just through a different
+# (also first-class) libusb backend.
+if(NOT APPLE)
+ExternalProject_Add(libusb_ext
+    SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libusb
+    BUILD_IN_SOURCE 1
+    # --disable-examples-build/--disable-tests-build: passed explicitly;
+    # this project never needs libusb's own example/test binaries, only
+    # libusb-1.0.a itself. (On Darwin they additionally failed to link
+    # without Apple frameworks this build has no reason to provide --
+    # moot here, since this target does not exist on Darwin at all.)
+    CONFIGURE_COMMAND ${AUTOTOOLS_ENV} ./autogen.sh --prefix=${DEPS_PREFIX}
+                        --enable-static --disable-shared
+                        --disable-udev
+                        --disable-examples-build --disable-tests-build
+    BUILD_COMMAND   ${AUTOTOOLS_ENV} make -j
+    INSTALL_COMMAND make install
+)
+endif()
 
 # ENABLE_OPENSSL/ENABLE_COMMONCRYPTO/ENABLE_WINDOWS_CRYPTO OFF: libzip only
 # needs OpenSSL/CommonCrypto at all for reading/writing AES-encrypted zip
@@ -799,14 +870,27 @@ ExternalProject_Add(libimobiledevice_glue_ext
 # exactly that guarantee (libirecovery_iokit_ext, a separate prefix and a
 # separate source copy). One explicit flag here gives the same guarantee
 # without a duplicate build of the same source at a second version.
-# --with-iokit unconditionally: the libusb backend is gone along with Linux
-# support, and IOKit is the backend blackb0x-pwn is confirmed working against on
-# real AppleTV3,2 hardware. Passing it explicitly rather than relying on
-# configure's default keeps the failure loud if IOKit ever goes missing.
-set(LIBIRECOVERY_BACKEND_ARGS --with-iokit)
+# The backend is per-platform, and each side is explicit about it:
+# on Apple, --with-iokit, because IOKit is the backend blackb0x-pwn's
+# checkm8 is confirmed working against on real AppleTV3,2 hardware, and
+# passing it explicitly keeps the failure loud if IOKit ever goes missing
+# instead of silently producing a libusb-backed archive. On Linux there is
+# no IOKit: the libusb backend is configure's own default there, and
+# libirecovery_ext additionally DEPENDS on libusb_ext (below) so the
+# vendored libusb-1.0.pc is installed before this configure probes for it.
+set(LIBIRECOVERY_BACKEND_ARGS "")
+if(APPLE)
+    set(LIBIRECOVERY_BACKEND_ARGS --with-iokit)
+endif()
+
+if(APPLE)
+    set(LIBIRECOVERY_PLATFORM_DEPS libplist_ext libimobiledevice_glue_ext)
+else()
+    set(LIBIRECOVERY_PLATFORM_DEPS libplist_ext libimobiledevice_glue_ext libusb_ext)
+endif()
 
 ExternalProject_Add(libirecovery_ext
-    DEPENDS         libplist_ext libimobiledevice_glue_ext
+    DEPENDS         ${LIBIRECOVERY_PLATFORM_DEPS}
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/third_party/libirecovery
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ${AUTOTOOLS_ENV} ./autogen.sh --prefix=${DEPS_PREFIX}
@@ -907,6 +991,20 @@ add_deps_imported_lib(imobiledevice  libimobiledevice.a)
 add_deps_imported_lib(irecovery      libirecovery-1.0.a)
 add_deps_imported_lib(imobiledevice_glue libimobiledevice-glue-1.0.a)
 add_deps_imported_lib(general        libgeneral.a)
+
+# deps::usb: the vendored libusb, Linux-only (see libusb_ext above).
+# libusb installs its public header to include/libusb-1.0/libusb.h (not
+# directly under include/), but consumers spell it `#include <libusb.h>`
+# unprefixed -- hence the two-directory INTERFACE_INCLUDE_DIRECTORIES,
+# and the file(MAKE_DIRECTORY ...) near the top of this file that makes
+# the libusb-1.0 directory exist at configure time.
+if(NOT APPLE)
+    add_library(deps::usb STATIC IMPORTED GLOBAL)
+    set_target_properties(deps::usb PROPERTIES
+        IMPORTED_LOCATION ${DEPS_LIB}/libusb-1.0.a
+        INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INCLUDE};${DEPS_INCLUDE}/libusb-1.0")
+    add_dependencies(deps::usb libusb_ext)
+endif()
 
 # idevicerestore_img3 (declared far above, compiling img3.c + log.c straight
 # from the idevicerestore submodule) wires its dep edges here, now that the
@@ -1117,11 +1215,13 @@ target_include_directories(xpwn BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
 # dmg-bin doesn't exist as a target on Apple at all (third_party/xpwn's own
 # dmg/CMakeLists.txt skips it there — it duplicates macOS's native
 # `hdiutil`, see that file's own comment) — omit it from this list there,
-# referencing a nonexistent target name is a hard CMake error.
-# dmg-bin is deliberately absent: third_party/xpwn's own dmg/CMakeLists.txt
-# skips that target on Apple entirely (it duplicates macOS's native hdiutil),
-# and naming a nonexistent target here is a hard CMake error.
+# referencing a nonexistent target name is a hard CMake error. On Linux
+# the target DOES exist and needs the identical treatment, so it is
+# appended there only.
 set(_wolfssl_include_targets ipsw xpwntool imagetool dripwn)
+if(NOT APPLE)
+    list(APPEND _wolfssl_include_targets dmg-bin)
+endif()
 foreach(t ${_wolfssl_include_targets})
     target_include_directories(${t} PRIVATE ${DEPS_INCLUDE})
     target_include_directories(${t} BEFORE PRIVATE ${DEPS_INCLUDE}/wolfssl)
@@ -1170,13 +1270,21 @@ target_link_libraries(blackb0x-pwn PRIVATE
     Threads::Threads)
 add_dependencies(blackb0x-pwn libirecovery_ext libimobiledevice_glue_ext libplist_ext)
 
-# The IOKit backend's own dependencies. With --with-iokit, libirecovery's
-# Makefile.am never populates $(libusb_CFLAGS)/$(libusb_LIBS) at all (confirmed
-# by reading configure.ac's AS_IF branching), so there is nothing
-# libusb-related to link and these two frameworks are what it needs instead.
-target_link_libraries(blackb0x-pwn PRIVATE
-    "-framework CoreFoundation"
-    "-framework IOKit")
+# The backend's own dependencies, and the only part of this target that
+# differs per platform. With --with-iokit, libirecovery's Makefile.am never
+# populates $(libusb_CFLAGS)/$(libusb_LIBS) at all (confirmed by reading
+# configure.ac's AS_IF branching), so an Apple build has nothing
+# libusb-related to link and needs the two frameworks instead. A Linux
+# build links the vendored libusb the libusb-backed archive was built
+# against.
+if(APPLE)
+    target_link_libraries(blackb0x-pwn PRIVATE
+        "-framework CoreFoundation"
+        "-framework IOKit")
+else()
+    target_link_libraries(blackb0x-pwn PRIVATE deps::usb)
+    add_dependencies(blackb0x-pwn libusb_ext)
+endif()
 
 # ---------------------------------------------------------------------------
 # blackb0x CLI executable
@@ -1251,11 +1359,22 @@ target_link_libraries(blackb0x PRIVATE
 # confirmed against the real link error, not guessed. blackb0x-pwn's own
 # Apple link line doesn't need Security/SystemConfiguration since it links
 # neither wolfSSL nor curl at all.
-target_link_libraries(blackb0x PRIVATE
-    "-framework CoreFoundation"
-    "-framework IOKit"
-    "-framework Security"
-    "-framework SystemConfiguration")
+#
+# None of those Darwin code paths exist in a Linux build of the same
+# libraries: libirecovery is libusb-backed there, and wolfSSL/curl use
+# their portable cert/proxy paths. A Linux build instead links the
+# vendored libusb (for libirecovery) -- the same deps::usb blackb0x-pwn
+# links -- and nothing else platform-specific.
+if(APPLE)
+    target_link_libraries(blackb0x PRIVATE
+        "-framework CoreFoundation"
+        "-framework IOKit"
+        "-framework Security"
+        "-framework SystemConfiguration")
+else()
+    target_link_libraries(blackb0x PRIVATE deps::usb)
+    add_dependencies(blackb0x libusb_ext)
+endif()
 
 # libusbmuxd.a (needed by common/userpref.c's usbmuxd_read_buid/
 # usbmuxd_read_pair_record/etc, its own daemon-side pairing-record cache
@@ -1404,10 +1523,12 @@ target_link_libraries(bake-firmware PRIVATE
 # anything else that talks to USB, which is the only thing that needed it.
 # Adding it "for symmetry" would link a framework nothing in this binary
 # references.
-target_link_libraries(bake-firmware PRIVATE
-    "-framework CoreFoundation"
-    "-framework Security"
-    "-framework SystemConfiguration")
+if(APPLE)
+    target_link_libraries(bake-firmware PRIVATE
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+endif()
 
 # iBoot32Patcher: not linked (it is GPLv3 — see its own block above), but it
 # IS fork/exec'd by Patcher.cpp at runtime, so it has to exist next to this
@@ -1452,10 +1573,12 @@ target_link_libraries(bake-kernel PRIVATE
     deps::wolfssl
     ZLIB::ZLIB)
 
-target_link_libraries(bake-kernel PRIVATE
-    "-framework CoreFoundation"
-    "-framework Security"
-    "-framework SystemConfiguration")
+if(APPLE)
+    target_link_libraries(bake-kernel PRIVATE
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+endif()
 
 add_dependencies(bake-kernel
     CBPatcher
@@ -1490,10 +1613,12 @@ target_link_libraries(bake-iboot PRIVATE
     deps::wolfssl
     ZLIB::ZLIB)
 
-target_link_libraries(bake-iboot PRIVATE
-    "-framework CoreFoundation"
-    "-framework Security"
-    "-framework SystemConfiguration")
+if(APPLE)
+    target_link_libraries(bake-iboot PRIVATE
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+endif()
 
 # iBoot32Patcher is fork/exec'd by patchiBSS()/patchiBEC() at runtime, so it
 # must exist next to this binary.
@@ -1532,10 +1657,12 @@ target_link_libraries(make-patches PRIVATE
     deps::wolfssl
     ZLIB::ZLIB)
 
-target_link_libraries(make-patches PRIVATE
-    "-framework CoreFoundation"
-    "-framework Security"
-    "-framework SystemConfiguration")
+if(APPLE)
+    target_link_libraries(make-patches PRIVATE
+        "-framework CoreFoundation"
+        "-framework Security"
+        "-framework SystemConfiguration")
+endif()
 
 add_dependencies(make-patches
     libplist_ext libfragmentzip_ext libgeneral_ext
@@ -1663,7 +1790,20 @@ ExternalProject_Add(apt_ext
 
 # A friendlier name than the _ext convention the linked dependencies use, since
 # this one is asked for by hand: `cmake --build build --target apt`.
-add_custom_target(apt DEPENDS apt_ext)
+#
+# Apple-only in practice: apt_ext's configure is wired to Homebrew prefixes
+# and a .dylib Berkeley DB (see its own block above), which is the whole
+# point of the vendored build there -- Debian's apt cannot be built for
+# Darwin with its Linux-only libraries. On Linux the vendored apt is not
+# built at all; the target exists only to explain why, rather than fail
+# deep inside apt's own CMake with a Homebrew-shaped error.
+if(APPLE)
+    add_custom_target(apt DEPENDS apt_ext)
+else()
+    add_custom_target(apt
+        COMMAND ${CMAKE_COMMAND} -E echo "The vendored 'apt' build tool is macOS-only (it exists to give a Darwin host a real Debian solver). On Linux, bake-firmware's ramdisk half is unsupported -- obtain firmware suites via the CI patch-bundle flow instead (install gh, sign in, re-run blackb0x)."
+        COMMENT "Vendored apt is not built on Linux")
+endif()
 
 # ---------------------------------------------------------------------------
 # Two build groups
@@ -1705,6 +1845,13 @@ add_custom_target(jailbreak
     DEPENDS blackb0x blackb0x-pwn
     COMMENT "Built the jailbreak binaries (blackb0x and blackb0x-pwn)")
 
+# On Linux the vendored apt is not part of authoring (see the apt block
+# above); everything else in the group is portable and builds there.
+set(AUTHORING_DEPS bake-firmware bake-kernel bake-iboot make-patches blackb0x_tests xpwntool iBoot32Patcher CBPatcher)
+if(APPLE)
+    list(APPEND AUTHORING_DEPS apt)
+endif()
+
 add_custom_target(authoring
-    DEPENDS bake-firmware bake-kernel bake-iboot make-patches apt blackb0x_tests xpwntool iBoot32Patcher CBPatcher
+    DEPENDS ${AUTHORING_DEPS}
     COMMENT "Built the authoring tools (bake-firmware, bake-kernel, bake-iboot, make-patches, vendored apt, tests, xpwntool)")

@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -77,8 +79,9 @@ std::string resolveImageKeyPath(const std::string& relativePath) {
 // binaryName, resolved via PATH at exec time).
 static std::string resolveOwnExecutableDir() {
     char exePath[PATH_MAX];
-    // _NSGetExecutablePath() may hand back a path containing symlinks,
-    // hence the realpath() pass.
+#if defined(__APPLE__)
+    // No /proc on Darwin; _NSGetExecutablePath() may hand back a path
+    // containing symlinks, hence the realpath() pass.
     uint32_t size = sizeof(exePath);
     bool haveExePath = (_NSGetExecutablePath(exePath, &size) == 0);
     if (haveExePath) {
@@ -89,6 +92,12 @@ static std::string resolveOwnExecutableDir() {
         }
     }
     ssize_t len = haveExePath ? static_cast<ssize_t>(strlen(exePath)) : -1;
+#else
+    // Linux: /proc/self/exe is the executable's own real path, already
+    // fully resolved by the kernel, so no realpath() pass is needed.
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len > 0) exePath[len] = '\0';
+#endif
     if (len > 0) {
         std::string dir(exePath);
         size_t slash = dir.find_last_of('/');

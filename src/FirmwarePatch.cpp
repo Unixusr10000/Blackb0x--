@@ -14,7 +14,16 @@
 #include "Img3Crypt.hpp"
 #include "Patcher.hpp"
 
+#if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
+#else
+// No CommonCrypto off Darwin. wolfSSL is this project's one crypto library
+// on every platform (see CMakeLists.txt), and both targets that compile
+// this file already link it and carry ${DEPS_INCLUDE} -- use its native
+// wolfcrypt SHA-256 API rather than the OpenSSL-compat shim, which would
+// additionally need the options.h force-include treatment.
+#include <wolfssl/wolfcrypt/sha256.h>
+#endif
 #include <bzlib.h>
 #include <plist/plist.h>
 
@@ -226,9 +235,10 @@ std::string indexFileName(const std::string& device, const std::string& build) {
 std::string sha256File(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return "";
+    std::vector<char> buf(1 << 20);
+#if defined(__APPLE__)
     CC_SHA256_CTX ctx;
     CC_SHA256_Init(&ctx);
-    std::vector<char> buf(1 << 20);
     while (in) {
         in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
         std::streamsize got = in.gcount();
@@ -236,6 +246,24 @@ std::string sha256File(const std::string& path) {
     }
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_Final(digest, &ctx);
+#else
+    wc_Sha256 ctx;
+    if (wc_InitSha256(&ctx) != 0) return "";
+    while (in) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        std::streamsize got = in.gcount();
+        if (got > 0 &&
+            wc_Sha256Update(&ctx, reinterpret_cast<const unsigned char*>(buf.data()),
+                            static_cast<size_t>(got)) != 0) {
+            wc_Sha256Free(&ctx);
+            return "";
+        }
+    }
+    unsigned char digest[WC_SHA256_DIGEST_SIZE];
+    int finalRc = wc_Sha256Final(&ctx, digest);
+    wc_Sha256Free(&ctx);
+    if (finalRc != 0) return "";
+#endif
     return hex(digest, sizeof(digest));
 }
 

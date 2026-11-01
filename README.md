@@ -42,7 +42,8 @@ Please star this project if it helped you.
 
 ## Requirements
 
-Both targets need the Xcode Command Line Tools, plus Homebrew.
+On macOS, both targets need the Xcode Command Line Tools, plus Homebrew.
+On Linux, see the Linux subsection under "Jailbreaking only" below.
 
 ### Tested hosts
 
@@ -60,9 +61,27 @@ under `src/`, see the C++17 conventions note in
 [`AGENTS.md`](AGENTS.md) before assuming a clean local build means a portable
 one.
 
+Linux Mint 21/22 (and Ubuntu 22.04/24.04, which Mint is based on) build and
+run the **jailbreak** target: the build is verified there, including the
+vendored libusb backend, normal-mode discovery, `--dry-run`, and the
+firmware-suite rebuild from CI's patches. Two honest caveats:
+
+* **checkm8 from a Linux host has never been confirmed working.** The
+  exploit sequence runs to completion and the task-struct overwrite does
+  not land; the full investigation is in
+  [`docs/HISTORY.md`](docs/HISTORY.md). The paths that do not need a
+  host-side checkm8 — AppleTV3,1 (pwned first by the Arduino), and
+  everything after a device is already in pwned DFU — are unaffected.
+  AppleTV2,1's SHAtter path is implemented from protocol analysis on both
+  platforms.
+* **Baking firmware is still macOS-only.** `bake-firmware`'s ramdisk half
+  uses `hdiutil`, and the authoring pipeline needs the old Xcodes below.
+  On Linux, use the `gh` flow: `blackb0x` rebuilds the suite it needs
+  from CI's published patches plus Apple's own IPSW, no bake required.
+
 ### Jailbreaking only
 
-To build and run the jailbreak:
+To build and run the jailbreak (macOS):
 
 ```sh
 brew install cmake autoconf automake libtool pkg-config gh
@@ -72,7 +91,83 @@ brew install cmake autoconf automake libtool pkg-config gh
 and rebuild the suite from Apple's own IPSW instead of baking one. No Apple
 firmware is redistributed; only binary patches against it are. Sign in once with `gh auth login`. Without it you
 can still jailbreak, but you have to bake the firmware yourself, which needs
-root and everything in the next list.
+root and everything in the next list. (On Linux there is no local-bake
+fallback — `gh` is required there.)
+
+#### Linux (Linux Mint / Ubuntu)
+
+Everything else — wolfSSL, curl, libusb, libimobiledevice, zlib, etc. — is
+vendored under `third_party/` and built from source, exactly as on macOS.
+What needs to be on the system already:
+
+```sh
+sudo apt update
+sudo apt install build-essential cmake autoconf automake libtool \
+                 pkg-config git gh usbmuxd
+sudo gh auth login   # or: gh auth login, as your own user
+```
+
+Build only the jailbreak target:
+
+```sh
+git clone --recurse-submodules https://github.com/regulad/Blackb0x--.git
+cd Blackb0x--
+cmake -S . -B build
+cmake --build build --target jailbreak -j"$(nproc)"
+```
+
+Then do the one-time system setup below before the first run.
+
+##### One-time system setup (Linux)
+
+**Blacklist `apple_mfi_fastcharge`.** The in-tree driver binds to any USB
+device with Apple's vendor ID and product ID in `0x1200`–`0x12ff` — which
+includes the Apple TV's DFU-mode PID (`0x1227`) — and independently resets
+the device while the exploit's timing-sensitive transfers are in flight.
+Blacklist it, don't just unload it (it reloads on every reconnect):
+
+```sh
+sudo tee /etc/modprobe.d/blacklist-apple-mfi-fastcharge.conf <<'EOF'
+blacklist apple_mfi_fastcharge
+EOF
+sudo modprobe -r apple_mfi_fastcharge   # only if currently loaded
+```
+
+**Run `usbmuxd` with `--no-preflight`.** Without it, Normal-mode discovery
+of this hardware silently never works. Add a systemd drop-in (check your
+distro's existing unit first with `systemctl cat usbmuxd` and adjust the
+path/args to match):
+
+```sh
+sudo mkdir -p /etc/systemd/system/usbmuxd.service.d
+sudo tee /etc/systemd/system/usbmuxd.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/usbmuxd --user usbmux --systemd --no-preflight
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart usbmuxd
+```
+
+(On Mint/Ubuntu the packaged unit runs `/usr/sbin/usbmuxd --user usbmux
+--systemd`; keep those and only add `--no-preflight`.)
+
+**Optional: run `blackb0x` without root.** Raw DFU/Recovery USB access is
+restricted to root by default. A udev rule can hand it to the `plugdev`
+group instead (Mint/Ubuntu ship that group by default):
+
+```sh
+sudo usermod -aG plugdev "$USER"
+sudo tee /etc/udev/rules.d/70-blackb0x.rules <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1222", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1227", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="128[0-3]", GROUP="plugdev", MODE="0660"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then log out and back in, and unplug/replug the Apple TV. Without this,
+just run it as `sudo ./build/blackb0x`.
 
 ### Development/authoring
 
@@ -112,7 +207,8 @@ cmake --build build --target authoring -j"$(sysctl -n hw.ncpu)"   # authoring on
 ```
 
 `sysctl -n hw.ncpu` is the macOS equivalent of `nproc`, which does not exist
-here.
+here. On Linux use `-j"$(nproc)"` instead (and `--target authoring` builds
+everything except the vendored apt there — see "Requirements" above).
 
 `bake-firmware` **must run as root**, including `--only bootchain`. It writes into
 root-owned files on a mounted ramdisk. Its output in `dist/` is handed back to the

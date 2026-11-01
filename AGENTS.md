@@ -14,20 +14,22 @@ original macOS Cocoa/Objective-C app (fully ported and deleted — see
 
 ## Conventions (don't re-litigate without asking)
 
-- **CLI-only, macOS-only.** No GUI — dropped, not dual-maintained. Linux support was
-  removed outright (checkm8 never worked there; see "Current status" below and
-  `docs/HISTORY.md`), and `CMakeLists.txt` hard-fails off Apple. **Two tested hosts,
-  and both are load-bearing:** `arm64` on macOS 26 Tahoe (primary) and `x86_64` on
+- **CLI-only.** No GUI — dropped, not dual-maintained. Linux support was
+  removed outright for a while (checkm8 never worked there; see "Current status"
+  below and `docs/HISTORY.md`) and has been restored for the `jailbreak` target;
+  `CMakeLists.txt` hard-fails off Apple and Linux. **The two macOS hosts are
+  load-bearing:** `arm64` on macOS 26 Tahoe (primary) and `x86_64` on
   macOS 11 Big Sur (the floor — and the reason for the C++17 conformance rule below,
   since its clang is the only one in reach that enforces the standard as published).
 - **Every third-party dependency is a git submodule under `third_party/`, built from
   source, statically linked.** Not FetchContent, not system packages, no exceptions —
   see the "vendored dependencies" table below and `CMakeLists.txt`'s
   `ExternalProject_Add` blocks. `zlib` used to be the one system-provided exception;
-  it no longer is.
-- **The only dynamic dependencies in the final binary are `libSystem`, `libc++`
+  it no longer is. (The restored `libusb` follows the same rule: vendored, not
+  the distro's `libusb-1.0-0-dev`.)
+- **On macOS, the only dynamic dependencies in the final binary are `libSystem`, `libc++`
   and Apple's own system frameworks.** Verify with `otool -L build/blackb0x` after
-  any dependency change (`ldd` is the Linux spelling and does not exist here). The
+  any dependency change. The
   real, verified output is six lines: CoreFoundation, IOKit, Security,
   SystemConfiguration, `libSystem.B.dylib`, `libc++.1.dylib` — unchanged by
   `blackb0x` linking xpwn/bsdiff, which are static. `bake-firmware` and
@@ -35,7 +37,9 @@ original macOS Cocoa/Objective-C app (fully ported and deleted — see
   device. `blackb0x-pwn` is CoreFoundation, IOKit and `libSystem` only, since it
   links neither wolfSSL nor curl. Nothing should ever appear from `/opt/homebrew`
   or `/usr/local`; that would mean a vendored dependency resolved against a system
-  copy instead of being built from source.
+  copy instead of being built from source. On Linux the equivalent check is
+  `ldd build/blackb0x`: only the C/C++ runtime and libc/libm should appear —
+  every project dependency, libusb included, is static there too.
 - **If a vendored library needs a code change, fork it to its own branch — never leave
   an uncommitted local patch sitting in a submodule's working tree.** Push the fork,
   point `.gitmodules`'s `url`/`branch` at it, keep the diff against the pinned base
@@ -262,10 +266,11 @@ statically linked. **Forked** means: patched on our own branch, pushed, pointed 
 | Submodule | Source | Forked? |
 |---|---|---|
 | `libplist` | libimobiledevice/libplist | No — current HEAD (2.7.0). Installs as `libplist-2.0`; `libplist_ext`'s install step drops a `libplist.pc` alias beside it so consumers still asking for the old `libplist` pkg-config name resolve. This single copy replaced a former two-build setup (a 2.1.0 pin + a separate `libplist-modern`) and retired `libplist_compat.c` — every current-API function it shimmed is real here now |
+| `libusb` | libusb/libusb | No — plain upstream at the pin it had before the Linux removal (`a45bb16`). **Linux-only**: libirecovery's USB backend there; nothing links it on Darwin. Built `--disable-udev` (netlink fallback — no static udev exists) |
 | `libusbmuxd`, `libimobiledevice-glue` | libimobiledevice/* | No — current HEAD, plain upstream (both build against the single `libplist` above) |
 | `libimobiledevice` | **regulad/libimobiledevice**@`legacy` | Yes — additive `--with-ssl-implementation=wolfssl`-selectable SSL backend for `idevice.c` (real OpenSSL/GnuTLS untouched, still selectable); plus `common/utils.{h,c}` now use libplist's `plist_format_t` instead of a local `enum plist_format_t` that collided with libplist ≥ 2.3.0's own (redefinition once built against current libplist) |
 | `idevicerestore` | libimobiledevice/idevicerestore | No — current HEAD. Not built as an app; only `src/img3.c` + `src/log.c` are compiled into the `idevicerestore_img3` static lib for `img3_stitch_component()` (`--stock-securerom`) |
-| `libirecovery` | **regulad/libirecovery**@`libusb-async-cancel-fix`, off synackuk/libirecovery | Yes — real stderr diagnostics on `irecv_send_buffer()`'s upload-failure paths, which previously returned `IRECV_E_USB_UPLOAD` silently unless built with `debug()` on; plus `irecv_usb_control_transfer_ex()`, which keeps the partial byte count on a stall/timeout that both ordinary wrappers discard. Built `--with-iokit` only. The branch also carries libusb-path fixes (a use-after-free, a double free and a non-terminating completion wait in `irecv_async_usb_control_transfer_with_cancel()`) that this project no longer compiles — the branch name is a leftover from when it did |
+| `libirecovery` | **regulad/libirecovery**@`libusb-async-cancel-fix`, off synackuk/libirecovery | Yes — real stderr diagnostics on `irecv_send_buffer()`'s upload-failure paths, which previously returned `IRECV_E_USB_UPLOAD` silently unless built with `debug()` on; plus `irecv_usb_control_transfer_ex()`, which keeps the partial byte count on a stall/timeout that both ordinary wrappers discard. Built `--with-iokit` on Apple; on Linux it builds against the vendored libusb instead, which is also what compiles the branch's libusb-path fixes (a use-after-free, a double free and a non-terminating completion wait in `irecv_async_usb_control_transfer_with_cancel()`) |
 | `libfragmentzip` | **regulad/libfragmentzip**@`fix-cxx-stdbool-header` | Yes — one header fix (C++/`<stdbool.h>` collision) |
 | `libgeneral` | tihmstar/libgeneral | No |
 | `xpwn` | **regulad/xpwn**@`legacy` | Yes — a wolfSSL AES-CBC buffer over-read fix in `img3.c`, plus disabling the legacy-libusb-0.1-only `pwnmetheus2` subdirectory |
@@ -320,9 +325,11 @@ privilege. `bake-iboot` is the one to reach for when arming a boot-args
 directive, since boot-args are compiled into the iBEC rather than set at
 runtime (see the `dist/` component list above and `docs/HISTORY.md`).
 
-**Root: `blackb0x` needs none; `bake-firmware` requires it unconditionally.** Linux's two
-reasons for root are gone (the loop mount and raw-USB device nodes), and `blackb0x`
-reaches the device through IOKit with no special permissions. `bake-firmware` checks
+**Root: `blackb0x` needs none on macOS; `bake-firmware` requires it unconditionally.**
+On macOS `blackb0x` reaches the device through IOKit with no special permissions.
+On Linux it needs write access to the DFU/Recovery device node — root, or the
+`plugdev` udev rule in the README — and `bake-firmware` does not run there at all.
+`bake-firmware` checks
 `geteuid()` up front for every run, including `--only bootchain`, which technically
 needs no privilege — a bake takes minutes, the two halves run together by default, and
 failing late after paying for every download and patch is worse than one uniform rule.
@@ -586,8 +593,9 @@ wants podman — it is a Linux-only maintenance tool, never invoked by a build o
 bake, kept only because growing `debcache/` needs a real apt-get solve. See its
 own header.
 - `usbmuxd` — macOS's own built-in daemon; Normal-mode discovery has nothing to talk
-  to without it. (Linux additionally needed it run with `--no-preflight` via a systemd
-  drop-in or discovery silently never fired; that requirement is gone with Linux.)
+  to without it. (On Linux it is the distro's `usbmuxd` package, and it must run
+  with `--no-preflight` via a systemd drop-in or discovery silently never fires;
+  see the README's Linux setup section.)
 - The invoking user's own `~/.ssh/authorized_keys`, if SSH access is wanted —
   `blackb0x` itself no longer touches this at all; run
   `scripts/push_authorized_keys.sh` by hand once the jailbreak is confirmed running
@@ -602,8 +610,10 @@ own header.
   back to unbuffered output. An earlier version of this code did fall back silently
   — that's exactly the "blind the whole time" bug documented in `docs/HISTORY.md`,
   reintroduced by treating this as optional. Don't re-add that fallback.
-- No kernel-module blacklisting, no udev rule, no systemd drop-in. All three were
-  Linux-only requirements and are gone; see the README's "No one-time system setup".
+- On macOS: no kernel-module blacklisting, no udev rule, no systemd drop-in.
+  On Linux all three exist again — the `apple_mfi_fastcharge` blacklist, the
+  `usbmuxd --no-preflight` drop-in, and the optional `plugdev` udev rule; see
+  the README's "One-time system setup (Linux)".
 
 ## Install-time design (what ships on the ramdisk, and how)
 
@@ -1061,19 +1071,34 @@ toolchain got there. The SDK half of that extraction used to be speculative
   reverse-engineered install logic (see `misc/README.md`) — both were
   flagged there as "we replicate the action, not the underlying mechanism."
 
-## Current status: macOS only
+## Current status: macOS and Linux
 
-**Linux support is removed.** The build refuses to configure off Apple (`CMakeLists.txt`
-fails fast rather than dying deeper in a vendored ExternalProject). Apple Silicon is the
-tested host.
+**Linux support was removed, and has been restored (the `linux-port` branch).**
+The build configures on both Apple and Linux (`CMakeLists.txt` fails fast on
+anything else rather than dying deeper in a vendored ExternalProject). Apple
+Silicon is the tested host for real-hardware jailbreaks; Linux (Mint 22 /
+Ubuntu 24.04) is build-verified for the `jailbreak` target. The restoration
+is deliberately narrow, mirroring the removal commit (`54639c3`) in reverse
+where the code had not moved since: the vendored `libusb` submodule is back
+at its old pin, `libirecovery` takes `--with-iokit` only on Apple and its
+libusb backend elsewhere, Apple framework links are `if(APPLE)`, and the
+`/proc/self/exe`, `/proc/<pid>/status` and `stat.st_atim` spellings are back
+behind `#if defined(__APPLE__)` branches. **Not restored:** `bake-firmware`'s
+Linux loop-mount ramdisk path (the surviving `hdiutil` half is macOS-only —
+on Linux, firmware suites come from the CI patch-bundle flow via `gh`), the
+vendored apt (macOS-only; its target explains why on Linux), and the
+Linux-only checkm8 investigation scripts, which stay deleted.
 
-`checkm8` never worked on Linux, and that is why. The exploit sequence runs to
+`checkm8` never worked on Linux, and that caveat survives the restoration
+unchanged. The exploit sequence runs to
 completion and the task-struct overwrite simply never lands. Four explanations were
 proposed and each refuted by later measurement — a host-stack limitation, the overwrite
 being refused, the bug-setup SETUP never arriving, and the consumed-byte count — and by
 the end **every observable matched a working macOS run while the outcome still
 differed**. `docs/HISTORY.md` records each dead end and why it died; the point of that
-detail is that nobody re-runs those experiments.
+detail is that nobody re-runs those experiments. Linux users get everything
+except a confirmed host-side checkm8: normal-mode discovery, the firmware
+pipeline, `--dry-run`, and the already-pwned paths (AppleTV3,1 via Arduino).
 
 Two findings from it are worth carrying forward regardless of platform:
 

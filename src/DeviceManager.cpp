@@ -343,6 +343,29 @@ static irecv_client_t get_tv_patient(uint64_t ecid, int attempts = 30) {
     return client;
 }
 
+#if !defined(__APPLE__)
+// Linux: checks /proc/<pid>/status for "D (disk sleep)" — uninterruptible
+// sleep, the one process state SIGKILL cannot terminate; the kernel only
+// wakes a D-state task when whatever blocking call it's in returns on its
+// own. Used to give a specific, actionable diagnostic instead of a generic
+// "still running" message when a kill attempt has no visible effect.
+static bool isUninterruptible(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char line[256];
+    bool result = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "State:", 6) == 0) {
+            result = strstr(line, "(disk sleep)") != nullptr;
+            break;
+        }
+    }
+    fclose(f);
+    return result;
+}
+#else
 // No /proc on Darwin, and proc_pidinfo()'s TASK_BASIC_INFO exposes no
 // equivalent "genuinely uninterruptible" distinction. `ps -o state=` is the
 // standard diagnostic here instead — BSD ps reports 'U' for uninterruptible
@@ -377,6 +400,7 @@ static bool isUninterruptible(pid_t pid) {
     if (n <= 0) return false;
     return strchr(buf, 'U') != nullptr;
 }
+#endif
 
 // Manual PATH search (no shell/system() — matches this file's own
 // no-shell convention elsewhere) for whether a bare command name resolves
@@ -473,8 +497,12 @@ static int runLineBufferedSubprocess(const std::string& binaryPath, const std::v
                 "checkm8: `stdbuf` (GNU coreutils) is required but not found on PATH -- "
                 "without it, %s's exploit progress can't be streamed live, which makes "
                 "a stuck/hanging run indistinguishable from a silently-working one. "
+#if defined(__APPLE__)
                 "Install it with `brew install coreutils` (this program looks for both the "
                 "unprefixed `stdbuf` and Homebrew's default `gstdbuf` name) and try again.\n"
+#else
+                "Install coreutils (e.g. `sudo apt install coreutils`) and try again.\n"
+#endif
                 , toolName);
         return -1;
     }
